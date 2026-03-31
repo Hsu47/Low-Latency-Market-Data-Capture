@@ -37,7 +37,7 @@ This gives a **per-packet kernel RX timestamp** at the earliest observable point
          ↑
 [ TCP Socket (Linux)      ]   ← packets queued here
          ↑
-[ NIC / vNIC (AWS EC2)    ]   ← packet arrives here (T0, unmeasured)
+[ NIC / vNIC (AWS EC2)    ]   ← T0: packet arrives — but timestamp is lost
 ```
 
 ### Enhanced Stack with Proxy (After)
@@ -47,14 +47,16 @@ This gives a **per-packet kernel RX timestamp** at the earliest observable point
          ↑
 [ SSL/TLS (OpenSSL)       ]   ← decrypts TLS records
          ↑
-[ TimestampAwareStream    ]   ← T0: recvmsg() extracts kernel RX timestamp
-         ↑                         stored per-read, accessible via get_last_ts_ns()
+[ TimestampAwareStream    ]   ← recvmsg() retrieves T0 from kernel ancillary data
+         ↑                         (T0 was already recorded at NIC arrival)
 [ TCP Socket (Linux)      ]
          ↑
-[ NIC / vNIC (AWS EC2)    ]   ← packet arrives
+[ NIC / vNIC (AWS EC2)    ]   ← T0: packet arrives, HW/kernel records timestamp here
 ```
 
-**Measured latency:** `T4 − T0` = internal stack latency (kernel → application), isolating jitter introduced by TLS + WebSocket framing.
+**Key distinction:** T0 is **stamped at the NIC** (hardware) or kernel RX path — not when `recvmsg()` is called. `TimestampAwareStream` merely *retrieves* that pre-recorded value via ancillary data. This is what makes it more accurate than any application-level timestamp.
+
+**Measured latency:** `T4 − T0` = full stack processing time (NIC arrival → application), capturing jitter from TCP queue, TLS decryption, and WebSocket framing.
 
 ---
 
@@ -130,13 +132,14 @@ Bybit Exchange (WSS)
         │
         ▼
 AWS EC2 NIC/vNIC (ENA)
-        │  packet arrives
+        │  T0 stamped here (HW or kernel RX timestamp)
         ▼
 TCP Socket kernel queue
-        │  recvmsg() called by TimestampAwareStream
+        │  T0 travels with packet as ancillary data
         ▼
 TimestampAwareStream.read_some()
-        ├──→ T0 = kernel RX timestamp (from cmsg SO_TIMESTAMPING)
+        │  recvmsg() retrieves T0 from cmsg (SO_TIMESTAMPING)
+        ├──→ T0 extracted — earliest observable arrival time
         ▼
 SSL/TLS decryption (OpenSSL)
         ▼
