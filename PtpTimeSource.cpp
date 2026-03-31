@@ -42,10 +42,10 @@ std::int64_t PtpTimeSource::now_ns() {
         throw std::runtime_error("PTP_CLOCK_GETTIME failed");
     }
 
-    std::int64_t ms =
-        static_cast<std::int64_t>(ts.tv_sec) * 1000
-      + static_cast<std::int64_t>(ts.tv_nsec / 1000000);
-    return ms;
+    std::int64_t ns =
+        static_cast<std::int64_t>(ts.tv_sec) * 1'000'000'000LL
+      + static_cast<std::int64_t>(ts.tv_nsec);
+    return ns;
 }
 
 #endif // __linux__

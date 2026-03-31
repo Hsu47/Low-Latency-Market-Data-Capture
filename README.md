@@ -1,62 +1,102 @@
 # Low-Latency Market Data Capture with Hardware-Level Timestamping on AWS
 
-> **Design goal:** Capture the exact kernel-level arrival time of every market data packet — before any application-layer processing — by intercepting the TCP read path with a custom `SO_TIMESTAMPING` proxy.
-
 ![Architecture](images/architecture.png)
 
 ---
 
-## The Problem
+## Why
 
-In a standard WebSocket-based market data feed, the application timestamps a message **after** it has been decrypted and framed — introducing hundreds of microseconds of unmeasurable, variable latency from:
+**In HFT, the timestamp on your market data is your ground truth. If it's wrong, everything downstream is wrong.**
 
-- Kernel TCP queue wait
-- TLS record decryption
-- WebSocket frame assembly
+Every standard WebSocket market data implementation timestamps the message *after* TLS decryption and WebSocket framing — introducing 50–500µs of jitter driven by scheduler preemption and decode overhead. This jitter is not just large. It's **unknowable and uncorrectable**.
 
-For HFT strategies that rely on precise event ordering (e.g., cross-venue arbitrage, latency-adjusted signal weighting), this latency is not just large — it's **unknowable**. You can't correct for what you can't measure.
+The consequences are real:
+
+- **Cross-venue arbitrage** — If you're trading the lead-lag between Bybit perpetuals and Binance spot, 100µs of timestamp noise is 20% of your total signal window. You cannot reliably determine which venue moved first.
+- **Market making** — Quote staleness detection requires knowing exactly when an adverse price move arrived. Application-layer timestamps can't distinguish "the price moved before my order" from "the price moved after" when the jitter exceeds the signal.
+- **TCA / execution quality** — If your reference price is timestamped 180µs late, your fill analysis systematically understates adverse selection. You scale the wrong strategies.
+
+The only fix is to capture the timestamp **before** any application-layer processing — at the kernel or NIC level, the moment the packet arrives.
 
 ---
 
-## The Solution
+## How
 
-Insert a **`TimestampAwareStream`** proxy between the raw TCP socket and the TLS layer. It wraps the socket's `read_some` calls with `recvmsg()`, extracting the kernel-attached `SO_TIMESTAMPING` ancillary data for each packet.
+Insert a custom `TimestampAwareStream` proxy **below TLS**, at the raw TCP socket layer. It intercepts every `read_some()` call with `recvmsg()`, extracting the kernel-attached `SO_TIMESTAMPING` ancillary data.
 
-This gives a **per-packet kernel RX timestamp** at the earliest observable point in the software stack — before decryption, before framing, before any user-space logic runs.
+```
+Standard path (wrong):
+  NIC arrival (T0) → TCP → TLS decrypt → WS frame → app timestamps here (T4)
+  Error = T4 - T0 = 50–500µs, unknown, uncorrectable.
+
+This project:
+  NIC arrival → kernel stamps T0 here
+                              ↓
+  TCP → [TimestampAwareStream reads T0 via recvmsg()] → TLS → WS → app (T4)
+  Now: T4 - T0 = measured stack latency. T0 - exchange_ts = observed network latency.
+```
+
+**Why this works:** `SO_TIMESTAMPING` with `SOF_TIMESTAMPING_RX_HARDWARE` instructs the NIC (or kernel, as fallback) to latch a timestamp the moment a packet is received — before the softirq fires, before any CPU processes the data. `recvmsg()` retrieves this pre-recorded value via the CMSG ancillary data interface. The timestamp is not taken when `recvmsg()` runs — it was already captured earlier at the hardware layer.
+
+**What most engineers miss:** The standard `clock_gettime()` after `ws.read()` embeds TLS decrypt time + WebSocket reassembly time + scheduler wake-up delay. On a loaded EC2 instance, this jitter regularly hits 200–500µs. On bare metal co-lo with a Solarflare NIC, `SO_TIMESTAMPING` gets you to sub-microsecond precision. This project implements the same pattern — transparently, without modifying any upstream library code.
+
+---
+
+## What
+
+A C++17 market data capture system for Bybit's v5 WebSocket feed that:
+
+1. **Stamps every packet at the kernel/NIC layer** via `TimestampAwareStream` — a custom Boost.Beast `SyncReadStream` template that wraps `recvmsg()` + `SO_TIMESTAMPING`, injected transparently between TCP and TLS.
+
+2. **Selects the most accurate available clock** via a pluggable `TimeSource` abstraction — PTP hardware clock (`/dev/ptp_ena` on AWS Nitro, ~100ns accuracy) with automatic fallback to `std::chrono::system_clock`.
+
+3. **Produces per-event latency records** — every orderbook update and trade carries `arrival_ts` (T0, kernel RX) and `app_ts` (T4), enabling:
+   - `T4 − T0` = internal stack processing latency
+   - `T0 − exchange_ts` = observed network latency (relative; requires clock sync for absolute accuracy)
 
 ---
 
 ## Architecture
 
-### Standard Stack (Before)
+### Before: Standard Stack
 
 ```
-[ WebSocket (Boost.Beast) ]   ← application sees message here (T4)
+[ WebSocket (Boost.Beast) ]   ← T_app: message timestamped here
          ↑
-[ SSL/TLS (OpenSSL)       ]   ← decrypts TLS records
+[ SSL/TLS (OpenSSL)       ]   ← variable decode time (1–10µs)
          ↑
-[ TCP Socket (Linux)      ]   ← packets queued here
+[ TCP Socket              ]   ← scheduler wake-up jitter (10–500µs on EC2)
          ↑
-[ NIC / vNIC (AWS EC2)    ]   ← T0: packet arrives — but timestamp is lost
+[ NIC / vNIC (AWS EC2)    ]   ← T0: actual packet arrival — LOST
 ```
 
-### Enhanced Stack with Proxy (After)
+### After: Enhanced Stack with Proxy
 
 ```
-[ WebSocket (Boost.Beast) ]   ← T4 (application receive time)
+[ WebSocket (Boost.Beast) ]   ← T4: application receive time
          ↑
-[ SSL/TLS (OpenSSL)       ]   ← decrypts TLS records
+[ SSL/TLS (OpenSSL)       ]
          ↑
-[ TimestampAwareStream    ]   ← recvmsg() retrieves T0 from kernel ancillary data
-         ↑                         (T0 was already recorded at NIC arrival)
-[ TCP Socket (Linux)      ]
+[ TimestampAwareStream    ]   ← recvmsg() reads T0 from kernel CMSG
+         ↑                       (T0 was already stamped at NIC arrival)
+[ TCP Socket              ]
          ↑
-[ NIC / vNIC (AWS EC2)    ]   ← T0: packet arrives, HW/kernel records timestamp here
+[ NIC / vNIC (AWS EC2)    ]   ← T0: stamped here by HW (or kernel softirq)
 ```
 
-**Key distinction:** T0 is **stamped at the NIC** (hardware) or kernel RX path — not when `recvmsg()` is called. `TimestampAwareStream` merely *retrieves* that pre-recorded value via ancillary data. This is what makes it more accurate than any application-level timestamp.
+**On AWS EC2:** Most ENA instances provide kernel software timestamps (`ts[0]`). AWS `c6in`/`m6in`/`r6in` with Nitro provide `SOF_TIMESTAMPING_RX_HARDWARE` (`ts[2]`). The proxy requests hardware first, silently falls back to software — `ts[2].tv_sec == 0` is the reliable runtime detector, not `setsockopt` return value.
 
-**Measured latency:** `T4 − T0` = full stack processing time (NIC arrival → application), capturing jitter from TCP queue, TLS decryption, and WebSocket framing.
+---
+
+## Use Cases
+
+| Strategy | Why T0 matters |
+|---|---|
+| **Cross-venue stat arb** (Bybit perp ↔ Binance spot) | Lead-lag signal lives at sub-500µs. Application timestamps bury the signal in noise. |
+| **Market making / adverse selection** | Distinguish whether a price move arrived before or after your quote. Quote staleness detection requires kernel-precision arrival time. |
+| **TCA / execution quality** | Reference price at the moment of signal trigger. 180µs late = wrong fill classification = wrong strategy sizing. |
+| **Exchange latency monitoring** | `T0 − exchange_ts` spikes indicate Bybit-side congestion before it affects fill rates. Pull back market making proactively. |
+| **Co-location benchmarking** | Measure actual wire-to-strategy latency across EC2 regions/instance types to optimize deployment. |
 
 ---
 
@@ -64,132 +104,82 @@ This gives a **per-packet kernel RX timestamp** at the earliest observable point
 
 ```
 ├── ProxyTemplate/
-│   ├── TimestampAwareStream.hpp     # Core: custom Boost.Beast SyncReadStream
+│   ├── TimestampAwareStream.hpp     # Core: SO_TIMESTAMPING proxy (Boost.Beast SyncReadStream)
 │   └── Guideline for using proxy.txt
 │
 ├── TCP test/
-│   ├── TcpClient.cpp                # Test sender: sends messages with 200ms interval
-│   └── TcpReceiver.cpp              # Test server: validates SO_TIMESTAMPING extraction
+│   ├── TcpClient.cpp                # Validates SO_TIMESTAMPING extraction independently
+│   └── TcpReceiver.cpp              # Shows ts[0]/ts[1]/ts[2] on raw TCP — no WS overhead
 │
-├── TimeSource.h                     # Abstract time source interface
-├── PtpTimeSource.h / .cpp           # PTP hardware clock (/dev/ptp_ena on AWS Nitro)
-├── SystemClockTimeSource.h / .cpp   # std::chrono::system_clock fallback
-├── TimeSourceFactory.h / .cpp       # Factory: selects best available clock
+├── TimeSource.h                     # Interface: now_ns() → nanoseconds since epoch
+├── PtpTimeSource.h / .cpp           # PTP clock: /dev/ptp_ena (AWS Nitro PHC, ~100ns)
+├── SystemClockTimeSource.h / .cpp   # Fallback: std::chrono::system_clock
+├── TimeSourceFactory.h / .cpp       # Runtime: picks best available clock
 │
-├── RawFileLogger.h / .cpp           # Buffered file logger (flush every N lines)
+├── RawFileLogger.h / .cpp           # Buffered logger (flush every N lines)
 └── bybit_orderbook.cpp              # Bybit v5 WebSocket client (Boost.Beast + OpenSSL)
 ```
 
 ---
 
-## Key Components
+## Key Technical Detail: `TimestampAwareStream`
 
-### `TimestampAwareStream` (Core Innovation)
-
-A C++ template class implementing the **Boost.Beast `SyncReadStream` concept** — making it a transparent drop-in replacement at the SSL stream layer.
+Implements Boost.Beast's `NextLayer` / `SyncReadStream` concept. Drop-in between raw socket and `beast::ssl_stream` — zero changes to TLS or WebSocket layers.
 
 ```cpp
-// Drop-in between TCP and TLS:
 tcp::socket                          raw_socket(ioc);
-TimestampAwareStream<tcp::socket>    ts_proxy(raw_socket);   // ← injected here
-beast::ssl_stream<TimestampAwareStream<tcp::socket>&>  ssl(ts_proxy, ctx);
+TimestampAwareStream<tcp::socket>    ts_proxy(raw_socket);  // proxy injected here
+beast::ssl_stream<TimestampAwareStream<tcp::socket>&> ssl(ts_proxy, ctx);
+ws::stream<...>                      ws_stream(ssl);
+
+ws_stream.read(buffer);
+long long t0_ns = ws_stream.next_layer().next_layer().get_last_ts_ns();
+long long t4_ns = time_source->now_ns();
+// latency_ns = t4_ns - t0_ns
 ```
 
-**Timestamp extraction flow:**
-1. Constructor calls `setsockopt(SO_TIMESTAMPING)` with `SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE | SOF_TIMESTAMPING_SOFTWARE`
-2. On each `read_some()`, calls `recvmsg()` instead of `recv()` to get ancillary data
-3. Parses `CMSG` chain for `SOL_SOCKET / SO_TIMESTAMPING`
-4. Reads `ts[2]` (raw HW) if available, else falls back to `ts[0]` (kernel SW)
-5. Exposes timestamp via `get_last_ts_ns()` after each read
+**Fallback logic:** Constructor sets `SO_TIMESTAMPING` flags and requests hardware. Runtime: if `ts[2].tv_sec == 0` after first read, hardware is not available on this NIC → use `ts[0]` (kernel software). `setsockopt` returning 0 is not a reliable indicator of hardware support.
 
-**Graceful fallback:** If hardware timestamping fails (unsupported NIC/kernel), automatically downgrades to kernel software timestamp — never silently breaks.
-
----
-
-### `TimeSource` Abstraction
-
-Pluggable clock interface with two implementations:
-
-| Implementation | Clock Source | Accuracy | Platform |
-|---|---|---|---|
-| `PtpTimeSource` | `/dev/ptp_ena` (AWS Nitro PHC) | ~100ns | Linux / AWS EC2 |
-| `SystemClockTimeSource` | `std::chrono::system_clock` | ~1µs | Any |
-
-`TimeSourceFactory` selects the best available source at runtime.
-
----
-
-### TCP Test Harness
-
-Standalone client/server pair (`TCP test/`) to validate `SO_TIMESTAMPING` independently of the full WebSocket stack — isolating kernel timestamp behavior before integrating with Boost.Beast.
-
----
-
-## Data Flow
-
-```
-Bybit Exchange (WSS)
-        │
-        ▼
-AWS EC2 NIC/vNIC (ENA)
-        │  T0 stamped here (HW or kernel RX timestamp)
-        ▼
-TCP Socket kernel queue
-        │  T0 travels with packet as ancillary data
-        ▼
-TimestampAwareStream.read_some()
-        │  recvmsg() retrieves T0 from cmsg (SO_TIMESTAMPING)
-        ├──→ T0 extracted — earliest observable arrival time
-        ▼
-SSL/TLS decryption (OpenSSL)
-        ▼
-WebSocket frame parser (Boost.Beast)
-        ▼
-JSON message decoded
-        ├──→ T4 = TimeSource::now_ns()
-        ├── Orderbook Handler  → {bid, ask, exchange_ts, arrival_ts=T0, app_ts=T4}
-        └── Tick Handler       → {price, qty, exchange_ts, arrival_ts=T0, app_ts=T4}
-                │
-                ▼
-        RawFileLogger → NoSQL DB
-        Derived: kernel_latency = T4 − T0
-                 one_way_latency = T0 − exchange_ts
-```
+**Current state:** Proxy is implemented and validated on raw TCP (see `TCP test/`). Integration into the async Boost.Beast WebSocket client is in progress — the synchronous read path is complete; async `read_some` wrapper is the remaining step.
 
 ---
 
 ## Technology Stack
 
-| Layer | Technology | Notes |
-|---|---|---|
-| Language | **C++17** | Templates, RAII, zero-overhead abstractions |
-| WebSocket | **Boost.Beast / Boost.Asio** | Custom stream injection via `SyncReadStream` concept |
-| TLS | **OpenSSL** | TLS 1.3, SNI |
-| Timestamping | **`SO_TIMESTAMPING` + `recvmsg()`** | `SOF_TIMESTAMPING_RX_HARDWARE` / `_RX_SOFTWARE` |
-| Hardware Clock | **PTP (`/dev/ptp_ena`)** | AWS Nitro PHC, ~100ns accuracy |
-| Infrastructure | **AWS EC2 (ENA)** | Enhanced Networking, Nitro hypervisor |
-| Data Source | **Bybit v5 WebSocket API** | `orderbook.1/50.BTCUSDT`, tick stream |
-| Storage | **NoSQL** | Per-event: arrival_ts + exchange_ts + latency |
+| Layer | Technology |
+|---|---|
+| Language | C++17 |
+| WebSocket / Async I/O | Boost.Beast / Boost.Asio |
+| TLS | OpenSSL (TLS 1.3, SNI) |
+| Packet Timestamping | `SO_TIMESTAMPING` + `recvmsg()` — `SOF_TIMESTAMPING_RX_HARDWARE` / `_RX_SOFTWARE` |
+| Hardware Clock | PTP `/dev/ptp_ena` (AWS Nitro PHC) |
+| Infrastructure | AWS EC2 ENA — Nitro `c6in`/`m6in` for HW timestamps |
+| Data Source | Bybit v5 WebSocket API (`orderbook.1/50.BTCUSDT`, tick stream) |
+| Storage | NoSQL (per-event: `arrival_ts`, `app_ts`, `exchange_ts`) |
 
 ---
 
 ## Skills Demonstrated
 
-| Skill | Where Applied |
+| Skill | Where |
 |---|---|
-| **Linux systems programming** | `SO_TIMESTAMPING`, `recvmsg()`, CMSG ancillary data parsing |
-| **C++ template metaprogramming** | `TimestampAwareStream<NextLayer>` as a generic Boost.Beast stream concept |
-| **Network stack internals** | TCP socket queue, kernel RX path, NIC/PHC timestamping pipeline |
-| **HFT infrastructure design** | Sub-microsecond timestamp propagation through multi-layer I/O stack |
-| **AWS networking** | ENA enhanced networking, Nitro PTP clock (`/dev/ptp_ena`) |
-| **Async I/O** | Boost.Asio event loop, async read chains |
-| **Software architecture** | Strategy pattern (TimeSource), factory pattern, layered stream abstraction |
+| Linux kernel networking | `SO_TIMESTAMPING`, `recvmsg()`, CMSG parsing, `ts[0]/ts[2]` layout |
+| C++ template design | `TimestampAwareStream<NextLayer>` — generic Boost.Beast stream concept |
+| HFT infrastructure | Kernel-to-application timestamp propagation through layered I/O stack |
+| AWS systems | ENA enhanced networking, Nitro PHC (`/dev/ptp_ena`), instance-type timestamp capability |
+| Software architecture | Strategy pattern (TimeSource), factory, layered stream composition |
 
 ---
 
 ## Build
 
-**macOS (development)**
+**Linux / AWS EC2**
+```bash
+g++ -std=c++17 bybit_orderbook.cpp \
+  -lboost_system -lssl -lcrypto -lpthread -O2 -o bybit_ws
+```
+
+**macOS (dev)**
 ```bash
 clang++ -std=c++17 bybit_orderbook.cpp \
   -I/opt/homebrew/include \
@@ -198,48 +188,20 @@ clang++ -std=c++17 bybit_orderbook.cpp \
   -lssl -lcrypto -lpthread -O2 -o bybit_ws
 ```
 
-**Linux / AWS EC2 (production)**
-```bash
-g++ -std=c++17 bybit_orderbook.cpp \
-  -lboost_system -lssl -lcrypto -lpthread -O2 -o bybit_ws
-```
-
-**Integrate TimestampAwareStream** (see `ProxyTemplate/Guideline for using proxy.txt`):
-```cpp
-#include "ProxyTemplate/TimestampAwareStream.hpp"
-
-// 1. Create raw socket and connect
-tcp::socket raw_socket(ioc);
-asio::connect(raw_socket, results.begin(), results.end());
-
-// 2. Wrap with proxy (injects SO_TIMESTAMPING in constructor)
-TimestampAwareStream<tcp::socket> ts_proxy(raw_socket);
-
-// 3. Build SSL + WebSocket on top
-beast::ssl_stream<TimestampAwareStream<tcp::socket>&> ssl_stream(ts_proxy, ssl_ctx);
-ws::stream<beast::ssl_stream<TimestampAwareStream<tcp::socket>&>&> ws_stream(ssl_stream);
-
-// 4. After each read, extract T0
-ws_stream.read(buffer);
-long long t0_ns = ws_stream.next_layer().next_layer().get_last_ts_ns();
-long long t4_ns = time_source->now_ns();
-long long latency_ns = t4_ns - t0_ns;
-```
-
 ---
 
-## Roadmap
+## Status
 
-| Status | Item |
+| | Item |
 |---|---|
 | ✅ | Bybit v5 WebSocket client (SSL + Boost.Beast) |
-| ✅ | `TimestampAwareStream` — `recvmsg` + `SO_TIMESTAMPING` proxy |
-| ✅ | `TimeSource` abstraction (PTP / SystemClock factory) |
-| ✅ | `RawFileLogger` — buffered file logger |
-| ✅ | TCP test harness (validate SO_TIMESTAMPING independently) |
-| 🔄 | Wire `TimestampAwareStream` into main WebSocket client |
-| ⬜ | Orderbook data model (L1/L50 snapshot + delta) |
-| ⬜ | Tick data model |
-| ⬜ | Stable client (reconnect, heartbeat, error handling) |
-| ⬜ | Orderbook / tick handlers with `arrival_ts` attachment |
-| ⬜ | NoSQL flush pipeline (arrival_ts + exchange_ts per event) |
+| ✅ | `TimestampAwareStream` — `SO_TIMESTAMPING` proxy, HW→SW fallback |
+| ✅ | `TimeSource` — PTP + SystemClock with factory |
+| ✅ | `RawFileLogger` — buffered file writer |
+| ✅ | TCP test harness — validates `ts[0]/ts[2]` extraction on raw socket |
+| 🔄 | Wire proxy into async WebSocket client (`async_read_some` wrapper) |
+| ⬜ | Orderbook model (L1/L50 snapshot + delta) |
+| ⬜ | Orderbook / tick handlers with `arrival_ts` |
+| ⬜ | NoSQL flush pipeline |
+
+*Designed and implemented independently as part of IE421 High Frequency Trading, UIUC.*
