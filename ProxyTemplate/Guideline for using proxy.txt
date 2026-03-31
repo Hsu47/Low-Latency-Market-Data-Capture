@@ -1,0 +1,45 @@
+Step1. 
+A. Add Header (Top of file)
+
+// [ADD THIS]
+#include "TimestampAwareStream.hpp"
+
+Step2.
+Change Connection Logic (Inside main)
+
+// 1. Create Raw Socket manually
+tcp::socket raw_socket(ioc);
+asio::connect(raw_socket, results.begin(), results.end());
+
+// 2. Wrap with Proxy
+TimestampAwareStream<tcp::socket> ts_proxy(raw_socket);
+
+// 3. Wrap with SSL (Pass by Reference &)
+beast::ssl_stream<TimestampAwareStream<tcp::socket>&> ssl_stream(ts_proxy, ssl_ctx);
+
+if(!SSL_set_tlsext_host_name(ssl_stream.native_handle(), host.c_str())) {
+    throw beast::system_error{beast::error_code{static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()}};
+}
+ssl_stream.handshake(asio::ssl::stream_base::client);
+
+// 4. Wrap with WebSocket (Type is longer now)
+ws::stream<beast::ssl_stream<TimestampAwareStream<tcp::socket>&>&> ws_stream(ssl_stream);
+
+Stpe3 .  
+Retrieve Timestamp (Inside while loop)
+
+ws_stream.read(buffer); -> you may change to read_some
+
+// [ADD THIS] ------------------------------------------------
+// 1. Get Hardware Time (T0) from the bottom layer
+long long hw_ms = ws_stream.next_layer().next_layer().get_last_ts_ms();
+
+// 2. Get Application Time (T4)
+long long app_ms = time_source->now_ms();
+
+// 3. Calculate Internal Latency
+long long latency = (hw_ms > 0) ? (app_ms - hw_ms) : -1;
+// -----------------------------------------------------------
+
+// Update your log output:
+std::cout << "Int.Lat: " << latency << "ms | ... " << std::endl;
